@@ -23,8 +23,9 @@ import dist
 
 
 class Args(Tap):
-    data_path: str = '/path/to/imagenet'
+    data_path: str = '/data2/tx813/VAR/datasets/imagenet-mini'
     exp_name: str = 'text'
+    model_type: str = 'transformer'  # choices: 'transformer', 'mamba'
     
     # VAE
     vfast: int = 0      # torch.compile VAE; =0: not compile; 1: compile with 'reduce-overhead'; 2: compile with 'max-autotune'

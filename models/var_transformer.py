@@ -11,8 +11,6 @@ from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
 
-from models.mamba.mixer_seq_simple import MambaLMHeadModel
-from models.mamba.config_mamba import MambaConfig
 
 class SharedAdaLin(nn.Linear):
     def forward(self, cond_BD):
@@ -37,17 +35,18 @@ class VAR(nn.Module):
         
         self.cond_drop_rate = cond_drop_rate
         self.prog_si = -1   # progressive training
-        self.patch_nums: Tuple[int] = patch_nums  # 定义了分阶段生成的patch数量，比如先生成1x1，再2x2，直到16x16。
-        self.L = sum(pn ** 2 for pn in self.patch_nums) #所有阶段token的总数
+        
+        self.patch_nums: Tuple[int] = patch_nums
+        self.L = sum(pn ** 2 for pn in self.patch_nums)
         self.first_l = self.patch_nums[0] ** 2
-        self.begin_ends = [] #每个阶段token的起止位置
+        self.begin_ends = []
         cur = 0
         for i, pn in enumerate(self.patch_nums):
             self.begin_ends.append((cur, cur+pn ** 2))
             cur += pn ** 2
         
         self.num_stages_minus_1 = len(self.patch_nums) - 1
-        self.rng = torch.Generator(device=dist.get_device()) #随机数生成器
+        self.rng = torch.Generator(device=dist.get_device())
         
         # 1. input (word) embedding
         quant: VectorQuantizer2 = vae_local.quantize
@@ -83,7 +82,6 @@ class VAR(nn.Module):
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         self.drop_path_rate = drop_path_rate
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule (linearly increasing)
-        # self.blocks是transformer主干，用条件和当前输入做自回归推理
         self.blocks = nn.ModuleList([
             AdaLNSelfAttn(
                 cond_dim=self.D, shared_aln=shared_aln,
@@ -116,20 +114,7 @@ class VAR(nn.Module):
         # 6. classifier head
         self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
         self.head = nn.Linear(self.C, self.V)
-
-        # 新增：初始化mamba模型
-        mamba_config = MambaConfig(
-            d_model=embed_dim,
-            n_layer=depth,
-            d_intermediate=int(embed_dim * mlp_ratio),
-            vocab_size=vae_local.vocab_size,
-            num_classes=num_classes,
-            num_tokens=self.L,
-            # 其它参数可根据需要补充
-        )
-        self.mamba_model = MambaLMHeadModel(mamba_config)
-
-    # 得到每个位置的token概率分布
+    
     def get_logits(self, h_or_h_and_residual: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], cond_BD: Optional[torch.Tensor]):
         if not isinstance(h_or_h_and_residual, torch.Tensor):
             h, resi = h_or_h_and_residual   # fused_add_norm must be used
@@ -137,8 +122,7 @@ class VAR(nn.Module):
         else:                               # fused_add_norm is not used
             h = h_or_h_and_residual
         return self.head(self.head_nm(h.float(), cond_BD).float()).float()
-
-    # Main process of autoregressive inference
+    
     @torch.no_grad()
     def autoregressive_infer_cfg(
         self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
@@ -158,68 +142,51 @@ class VAR(nn.Module):
         """
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
-
+        
         if label_B is None:
             label_B = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True, generator=rng).reshape(B)
         elif isinstance(label_B, int):
             label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
-
-        # 准备输入
+        
         sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
+        
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
         next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
-
+        
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
-
-        # 使用mamba模型进行自回归推理
-        input_ids = torch.zeros((2 * B, self.L), dtype=torch.long, device=sos.device)  # 初始化token id序列
-        position_ids = torch.arange(self.L, device=sos.device).unsqueeze(0).expand(2 * B, -1)
-        cond = torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0).unsqueeze(1)
-
-        # 逐步生成token
-        for si, pn in enumerate(self.patch_nums):
+        
+        for b in self.blocks: b.attn.kv_caching(True)
+        for si, pn in enumerate(self.patch_nums):   # si: i-th segment
             ratio = si / self.num_stages_minus_1
-            cur_L += pn * pn
-            # 只生成当前阶段的token
-            if si == 0:
-                # 第一阶段直接用sos
-                input_ids_stage = input_ids[:, :self.first_l]
-                position_ids_stage = position_ids[:, :self.first_l]
-            else:
-                input_ids_stage = input_ids[:, :cur_L]
-                position_ids_stage = position_ids[:, :cur_L]
-
-            # Mamba模型推理
-            output = self.mamba_model(
-                input_ids_stage,
-                position_ids=position_ids_stage,
-                cond=cond,
-                inference_params=None,
-                num_last_tokens=pn * pn
-            )
-            logits_BlV = output.logits[:, -pn * pn:, :]
-
+            # last_L = cur_L
+            cur_L += pn*pn
+            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+            x = next_token_map
+            AdaLNSelfAttn.forward
+            for b in self.blocks:
+                x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
+            logits_BlV = self.get_logits(x, cond_BD)
+            
             t = cfg * ratio
-            logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
-
+            logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
+            
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
-            input_ids[:B, cur_L - pn * pn:cur_L] = idx_Bl
-            input_ids[B:, cur_L - pn * pn:cur_L] = idx_Bl  # CFG双份
-
-            if not more_smooth:
-                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)
-            else:
-                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
+            if not more_smooth: # this is the default case
+                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
+            else:   # not used when evaluating FID/IS/Precision/Recall
+                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
                 h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-
+            
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
             f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
             if si != self.num_stages_minus_1:   # prepare for next stage
                 next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
                 next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
                 next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
-
+        
+        for b in self.blocks: b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
     
     def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV

@@ -18,3 +18,7 @@ local_output*
 *.log
 *.txt
 *.ipynb
+datasets/
+local_output/
+__pycache__/
+wandb/

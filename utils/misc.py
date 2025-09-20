@@ -87,6 +87,9 @@ class SyncPrint(object):
         self.file_stream.flush()
         self.enabled = True
     
+    def isatty(self):
+        return False
+        
     def write(self, message):
         self.terminal_stream.write(message)
         self.file_stream.write(message)

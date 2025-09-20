@@ -15,6 +15,7 @@ from utils.data import build_dataset
 from utils.data_sampler import DistInfiniteBatchSampler, EvalDistributedSampler
 from utils.misc import auto_resume
 
+import wandb
 
 def build_everything(args: arg_util.Args):
     # resume
@@ -77,7 +78,14 @@ def build_everything(args: arg_util.Args):
     
     # build models
     from torch.nn.parallel import DistributedDataParallel as DDP
-    from models import VAR, VQVAE, build_vae_var
+    # Compare the modified model with the original one:
+    import importlib
+    if args.model_type == "transformer":
+        VAR = importlib.import_module("models.var_transformer").VAR
+    elif args.model_type == "mamba":
+        VAR = importlib.import_module("models.var").VAR
+    from models.vqvae import VQVAE
+    from models import build_vae_var
     from trainer import VARTrainer
     from utils.amp_sc import AmpOptimizer
     from utils.lr_control import filter_params
@@ -99,7 +107,11 @@ def build_everything(args: arg_util.Args):
     
     vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
     var_wo_ddp: VAR = args.compile_model(var_wo_ddp, args.tfast)
-    var: DDP = (DDP if dist.initialized() else NullDDP)(var_wo_ddp, device_ids=[dist.get_local_rank()], find_unused_parameters=False, broadcast_buffers=False)
+    var: DDP = (DDP if dist.initialized() else NullDDP)(
+        var_wo_ddp, device_ids=[dist.get_local_rank()],
+        find_unused_parameters=True,  #自动处理没有用到的参数
+        broadcast_buffers=False
+    )
     
     print(f'[INIT] VAR model = {var_wo_ddp}\n\n')
     count_p = lambda m: f'{sum(p.numel() for p in m.parameters())/1e6:.2f}'
@@ -172,7 +184,15 @@ def main_training():
     args: arg_util.Args = arg_util.init_dist_and_get_args()
     if args.local_debug:
         torch.autograd.set_detect_anomaly(True)
-    
+
+    # 初始化 wandb
+    if dist.is_master():
+        wandb.init(
+            project="VAR",
+            name=f"VAR_run_{args.model_type}_{time.strftime('%Y%m%d_%H%M%S')}",
+            config=args.__dict__
+        )
+
     (
         tb_lg, trainer,
         start_ep, start_it,
@@ -196,7 +216,19 @@ def main_training():
         stats, (sec, remain_time, finish_time) = train_one_ep(
             ep, ep == start_ep, start_it if ep == start_ep else 0, args, tb_lg, ld_train, iters_train, trainer
         )
-        
+
+        # 记录关键指标到 wandb
+        if dist.is_master():
+            wandb.log({
+                "train/L_mean": stats['Lm'],
+                "train/L_tail": stats['Lt'],
+                "train/Acc_mean": stats['Accm'],
+                "train/Acc_tail": stats['Acct'],
+                "train/grad_norm": stats['tnm'],
+                "train/epoch": ep,
+                "train/sec_per_epoch": sec,
+            }, step=ep)
+
         L_mean, L_tail, acc_mean, acc_tail, grad_norm = stats['Lm'], stats['Lt'], stats['Accm'], stats['Acct'], stats['tnm']
         best_L_mean, best_acc_mean = min(best_L_mean, L_mean), max(best_acc_mean, acc_mean)
         if L_tail != -1: best_L_tail, best_acc_tail = min(best_L_tail, L_tail), max(best_acc_tail, acc_tail)
@@ -205,7 +237,7 @@ def main_training():
         args.remain_time, args.finish_time = remain_time, finish_time
         
         AR_ep_loss = dict(L_mean=L_mean, L_tail=L_tail, acc_mean=acc_mean, acc_tail=acc_tail)
-        is_val_and_also_saving = (ep + 1) % 10 == 0 or (ep + 1) == args.ep
+        is_val_and_also_saving = (ep + 1) % 2 == 0 or (ep + 1) == args.ep # default: every 2 ep and the last ep
         if is_val_and_also_saving:
             val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail, tot, cost = trainer.eval_ep(ld_val)
             best_updated = best_val_loss_tail > val_loss_tail
@@ -215,9 +247,11 @@ def main_training():
             args.vL_mean, args.vL_tail, args.vacc_mean, args.vacc_tail = val_loss_mean, val_loss_tail, val_acc_mean, val_acc_tail
             print(f' [*] [ep{ep}]  (val {tot})  Lm: {L_mean:.4f}, Lt: {L_tail:.4f}, Acc m&t: {acc_mean:.2f} {acc_tail:.2f},  Val cost: {cost:.2f}s')
             
-            if dist.is_local_master():
-                local_out_ckpt = os.path.join(args.local_out_dir_path, 'ar-ckpt-last.pth')
-                local_out_ckpt_best = os.path.join(args.local_out_dir_path, 'ar-ckpt-best.pth')
+            if dist.is_master():
+                # 为checkpoint文件名添加模型类型后缀，避免不同模型进程写入同一个文件
+                model_tag = getattr(args, 'model_type', 'default')
+                local_out_ckpt = os.path.join(args.local_out_dir_path, f'ar-ckpt-last-{model_tag}.pth')
+                local_out_ckpt_best = os.path.join(args.local_out_dir_path, f'ar-ckpt-best-{model_tag}.pth')
                 print(f'[saving ckpt] ...', end='', flush=True)
                 torch.save({
                     'epoch':    ep+1,
@@ -228,7 +262,44 @@ def main_training():
                 if best_updated:
                     shutil.copy(local_out_ckpt, local_out_ckpt_best)
                 print(f'     [saving ckpt](*) finished!  @ {local_out_ckpt}', flush=True, clean=True)
-            dist.barrier()
+                # === 采样图片并上传到 wandb ===
+                sample_imgs = []
+                try:
+                    # 从验证集采样一批图片
+                    for i, (inp, label) in enumerate(ld_val):
+                        if i >= 4: break  # 只采样4张
+                        inp = inp.to(args.device)
+                        with torch.no_grad():
+                            # 这里假设 trainer/vae_local 有 decode 方法
+                            if hasattr(trainer.vae_local, "decode"):
+                                recon = trainer.vae_local.decode(inp)
+                                # 转为 numpy 并归一化到0~255
+                                img = recon[0].cpu().numpy().transpose(1,2,0)
+                                img = ((img + 1) * 127.5).clip(0,255).astype("uint8")
+                                sample_imgs.append(wandb.Image(img, caption=f"ep{ep}_val_{i}"))
+                except Exception as e:
+                    print(f"[wandb image] error: {e}")
+                if sample_imgs:
+                    wandb.log({"samples": sample_imgs}, step=ep)
+                
+                gen_imgs = []
+                try:
+                    for i, (inp, label) in enumerate(ld_val):
+                        if i >= 2: break  # 只采样2张，防止太慢
+                        label = label.to(args.device)
+                        with torch.no_grad():
+                            # 用VAR自回归生成图片
+                            gen_img = trainer.var_wo_ddp.autoregressive_infer_cfg(
+                                B=1, label_B=label[0:1], g_seed=None, cfg=1.5, top_k=0, top_p=0.0
+                            )
+                            # gen_img: (1, 3, H, W)，归一化到0~255
+                            img = gen_img[0].cpu().numpy().transpose(1,2,0)
+                            img = (img * 255).clip(0,255).astype("uint8")
+                            gen_imgs.append(wandb.Image(img, caption=f"ep{ep}_gen_{i}"))
+                except Exception as e:
+                    print(f"[wandb gen image] error: {e}")
+                if gen_imgs:
+                    wandb.log({"gen_samples": gen_imgs}, step=ep)
         
         print(    f'     [ep{ep}]  (training )  Lm: {best_L_mean:.3f} ({L_mean:.3f}), Lt: {best_L_tail:.3f} ({L_tail:.3f}),  Acc m&t: {best_acc_mean:.2f} {best_acc_tail:.2f},  Remain: {remain_time},  Finish: {finish_time}', flush=True)
         tb_lg.update(head='AR_ep_loss', step=ep+1, **AR_ep_loss)
