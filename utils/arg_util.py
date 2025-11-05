@@ -136,6 +136,9 @@ class Args(Tap):
     
     local_debug: bool = 'KEVIN_LOCAL' in os.environ
     dbg_nan: bool = False   # 'KEVIN_LOCAL' in os.environ
+
+    # logging
+    log_per: int = 20       # 每个 epoch 打印多少次日志；默认20次（更密集的可视化进度）
     
     def compile_model(self, m, fast):
         if fast == 0 or self.local_debug:

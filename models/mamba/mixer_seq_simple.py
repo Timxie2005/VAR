@@ -12,6 +12,7 @@ import copy
 
 from collections import namedtuple
 from functools import partial
+from types import SimpleNamespace
 
 from mamba_ssm.models.config_mamba import MambaConfig
 from mamba_ssm.modules.mamba_simple import Mamba
@@ -378,7 +379,7 @@ class MixerModel(nn.Module):
         return hidden_states
 
 
-class MambaLMHeadModel(nn.Module, GenerationMixin):
+class MambaLMHeadModel(nn.Module):
 
     def __init__(
         self,
@@ -434,29 +435,70 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
 
-    def forward(self, input_ids, position_ids=None, cond=None, inference_params=None, num_last_tokens=0, **mixer_kwargs):
+    class Output(SimpleNamespace):
+        pass
+
+    def forward(
+        self,
+        input_ids: torch.Tensor = None,
+        position_ids: torch.Tensor = None,
+        cond: torch.Tensor = None,
+        inputs_embeds: torch.Tensor = None,
+        inference_params=None,
+        attention_mask: torch.Tensor = None,
+        **kwargs
+    ):
         """
-        num_last_tokens: if > 0, only return the logits for the last n tokens
+        两种模式:
+          1) 旧路径: input_ids + position_ids + cond  -> 用 backbone.embeddings + (在训练时把 cond token 拼接为首 token)
+          2) VAR 新路径: inputs_embeds + cond         -> 直接使用外部已经加好 pos/lvl/class 信息的序列，不再拼接 cond token
+        cond: (B,)  class ids
+        返回: Output(last_hidden_state=..., logits=可选)
         """
-        is_train = inference_params is None
+        use_embed_path = inputs_embeds is not None
+        if use_embed_path and (input_ids is not None or position_ids is not None):
+            raise ValueError("inputs_embeds 模式下不要再传 input_ids/position_ids")
+        if not use_embed_path and input_ids is None:
+            raise ValueError("必须提供 input_ids 或 inputs_embeds 之一")
+        if cond is None:
+            raise ValueError("必须提供 cond (类别 id)")
 
-        if not is_train and inference_params.seqlen_offset > 0:
-            input_ids, _ = torch.split(input_ids, len(input_ids) // 2, dim=0)
-            input_ids = torch.cat([input_ids, input_ids])
+        if not use_embed_path:
+            # 走原始 MixerModel.forward (保持它的行为)
+            hidden_states = self.backbone(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                cond=cond.unsqueeze(1),   # 原实现里 cond 期望 (B,1)
+                inference_params=inference_params,
+            )
+            # backbone.forward 已完成 final_layer
+            last_hidden = hidden_states
+        else:
+            # 直接使用外部准备好的浮点序列 (B,L,C)
+            backbone = self.backbone
+            is_train = inference_params is None
+            cond_embed = backbone.cls_embed(cond, train=is_train)  # (B,C)
+            hidden_states = inputs_embeds  # 已包含 pos + lvl + class_emb (VAR 里做了)
+            ada_cond = backbone.adaln_group(cond_embed).chunk(backbone.num_groups, dim=1)
+            residual = None
+            for i, layer in enumerate(backbone.layers):
+                hidden_states, residual = layer(
+                    hidden_states, residual, ada_cond[i % backbone.num_groups], inference_params=inference_params
+                )
+            if not backbone.fused_add_norm:
+                residual = (hidden_states + residual) if residual is not None else hidden_states
+                hidden_states = backbone.norm_f(residual.to(dtype=backbone.norm_f.weight.dtype))
+            else:
+                # 如果 fused 路径，本地简单回退 (或直接调用 norm_f)
+                hidden_states = backbone.norm_f((hidden_states + residual) if residual is not None else hidden_states)
+            hidden_states = backbone.final_layer(hidden_states, cond_embed)
+            last_hidden = hidden_states
 
-        hidden_states = self.backbone(input_ids, position_ids, cond, inference_params=inference_params, **mixer_kwargs)
-        if num_last_tokens > 0:
-            hidden_states = hidden_states[:, -num_last_tokens:]
-        lm_logits = self.lm_head(hidden_states)
-
-        if not is_train:
-            # classifier free guidance
-            cond_logits, uncond_logits = torch.split(lm_logits, len(lm_logits) // 2, dim=0)
-            lm_logits = uncond_logits + (cond_logits - uncond_logits) * self.cfg_scale
-            lm_logits = lm_logits.repeat(2, 1, 1)
-
-        CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
-        return CausalLMOutput(logits=lm_logits)
+        out = self.Output()
+        out.last_hidden_state = last_hidden
+        # 可选提供 logits (VAR 当前不用)
+        out.logits = self.lm_head(last_hidden)
+        return out
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name, device=None, dtype=None, **kwargs):

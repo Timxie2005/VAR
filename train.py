@@ -105,9 +105,10 @@ def build_everything(args: arg_util.Args):
     dist.barrier()
     vae_local.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
     
-    vae_local: VQVAE = args.compile_model(vae_local, args.vfast)
-    var_wo_ddp: VAR = args.compile_model(var_wo_ddp, args.tfast)
-    var: DDP = (DDP if dist.initialized() else NullDDP)(
+    vae_local = args.compile_model(vae_local, args.vfast)
+    var_wo_ddp = args.compile_model(var_wo_ddp, args.tfast)
+    var_wo_ddp = var_wo_ddp.to(dist.get_device())
+    var = (DDP if dist.initialized() else NullDDP)(
         var_wo_ddp, device_ids=[dist.get_local_rank()],
         find_unused_parameters=True,  #自动处理没有用到的参数
         broadcast_buffers=False
@@ -185,13 +186,13 @@ def main_training():
     if args.local_debug:
         torch.autograd.set_detect_anomaly(True)
 
-    # 初始化 wandb
-    if dist.is_master():
-        wandb.init(
-            project="VAR",
-            name=f"VAR_run_{args.model_type}_{time.strftime('%Y%m%d_%H%M%S')}",
-            config=args.__dict__
-        )
+    # # 初始化 wandb
+    # if dist.is_master():
+    #     wandb.init(
+    #         project="VAR",
+    #         name=f"VAR_run_{args.model_type}_{time.strftime('%Y%m%d_%H%M%S')}",
+    #         config=args.__dict__
+    #     )
 
     (
         tb_lg, trainer,
@@ -218,16 +219,16 @@ def main_training():
         )
 
         # 记录关键指标到 wandb
-        if dist.is_master():
-            wandb.log({
-                "train/L_mean": stats['Lm'],
-                "train/L_tail": stats['Lt'],
-                "train/Acc_mean": stats['Accm'],
-                "train/Acc_tail": stats['Acct'],
-                "train/grad_norm": stats['tnm'],
-                "train/epoch": ep,
-                "train/sec_per_epoch": sec,
-            }, step=ep)
+        # if dist.is_master():
+        #     wandb.log({
+        #         "train/L_mean": stats['Lm'],
+        #         "train/L_tail": stats['Lt'],
+        #         "train/Acc_mean": stats['Accm'],
+        #         "train/Acc_tail": stats['Acct'],
+        #         "train/grad_norm": stats['tnm'],
+        #         "train/epoch": ep,
+        #         "train/sec_per_epoch": sec,
+        #     }, step=ep)
 
         L_mean, L_tail, acc_mean, acc_tail, grad_norm = stats['Lm'], stats['Lt'], stats['Accm'], stats['Acct'], stats['tnm']
         best_L_mean, best_acc_mean = min(best_L_mean, L_mean), max(best_acc_mean, acc_mean)
@@ -263,43 +264,43 @@ def main_training():
                     shutil.copy(local_out_ckpt, local_out_ckpt_best)
                 print(f'     [saving ckpt](*) finished!  @ {local_out_ckpt}', flush=True, clean=True)
                 # === 采样图片并上传到 wandb ===
-                sample_imgs = []
-                try:
-                    # 从验证集采样一批图片
-                    for i, (inp, label) in enumerate(ld_val):
-                        if i >= 4: break  # 只采样4张
-                        inp = inp.to(args.device)
-                        with torch.no_grad():
-                            # 这里假设 trainer/vae_local 有 decode 方法
-                            if hasattr(trainer.vae_local, "decode"):
-                                recon = trainer.vae_local.decode(inp)
-                                # 转为 numpy 并归一化到0~255
-                                img = recon[0].cpu().numpy().transpose(1,2,0)
-                                img = ((img + 1) * 127.5).clip(0,255).astype("uint8")
-                                sample_imgs.append(wandb.Image(img, caption=f"ep{ep}_val_{i}"))
-                except Exception as e:
-                    print(f"[wandb image] error: {e}")
-                if sample_imgs:
-                    wandb.log({"samples": sample_imgs}, step=ep)
+                # sample_imgs = []
+                # try:
+                #     # 从验证集采样一批图片
+                #     for i, (inp, label) in enumerate(ld_val):
+                #         if i >= 4: break  # 只采样4张
+                #         inp = inp.to(args.device)
+                #         with torch.no_grad():
+                #             # 这里假设 trainer/vae_local 有 decode 方法
+                #             if hasattr(trainer.vae_local, "decode"):
+                #                 recon = trainer.vae_local.decode(inp)
+                #                 # 转为 numpy 并归一化到0~255
+                #                 img = recon[0].cpu().numpy().transpose(1,2,0)
+                #                 img = ((img + 1) * 127.5).clip(0,255).astype("uint8")
+                #                 sample_imgs.append(wandb.Image(img, caption=f"ep{ep}_val_{i}"))
+                # except Exception as e:
+                #     print(f"[wandb image] error: {e}")
+                # if sample_imgs:
+                #     wandb.log({"samples": sample_imgs}, step=ep)
                 
-                gen_imgs = []
-                try:
-                    for i, (inp, label) in enumerate(ld_val):
-                        if i >= 2: break  # 只采样2张，防止太慢
-                        label = label.to(args.device)
-                        with torch.no_grad():
-                            # 用VAR自回归生成图片
-                            gen_img = trainer.var_wo_ddp.autoregressive_infer_cfg(
-                                B=1, label_B=label[0:1], g_seed=None, cfg=1.5, top_k=0, top_p=0.0
-                            )
-                            # gen_img: (1, 3, H, W)，归一化到0~255
-                            img = gen_img[0].cpu().numpy().transpose(1,2,0)
-                            img = (img * 255).clip(0,255).astype("uint8")
-                            gen_imgs.append(wandb.Image(img, caption=f"ep{ep}_gen_{i}"))
-                except Exception as e:
-                    print(f"[wandb gen image] error: {e}")
-                if gen_imgs:
-                    wandb.log({"gen_samples": gen_imgs}, step=ep)
+                # gen_imgs = []
+                # try:
+                #     for i, (inp, label) in enumerate(ld_val):
+                #         if i >= 2: break  # 只采样2张，防止太慢
+                #         label = label.to(args.device)
+                #         with torch.no_grad():
+                #             # 用VAR自回归生成图片
+                #             gen_img = trainer.var_wo_ddp.autoregressive_infer_cfg(
+                #                 B=1, label_B=label[0:1], g_seed=None, cfg=1.5, top_k=0, top_p=0.0
+                #             )
+                #             # gen_img: (1, 3, H, W)，归一化到0~255
+                #             img = gen_img[0].cpu().numpy().transpose(1,2,0)
+                #             img = (img * 255).clip(0,255).astype("uint8")
+                #             gen_imgs.append(wandb.Image(img, caption=f"ep{ep}_gen_{i}"))
+                # except Exception as e:
+                #     print(f"[wandb gen image] error: {e}")
+                # if gen_imgs:
+                #     wandb.log({"gen_samples": gen_imgs}, step=ep)
         
         print(    f'     [ep{ep}]  (training )  Lm: {best_L_mean:.3f} ({L_mean:.3f}), Lt: {best_L_tail:.3f} ({L_tail:.3f}),  Acc m&t: {best_acc_mean:.2f} {best_acc_tail:.2f},  Remain: {remain_time},  Finish: {finish_time}', flush=True)
         tb_lg.update(head='AR_ep_loss', step=ep+1, **AR_ep_loss)
@@ -340,7 +341,15 @@ def train_one_ep(ep: int, is_first_ep: bool, start_it: int, args: arg_util.Args,
         warnings.filterwarnings('ignore', category=UserWarning)
     g_it, max_it = ep * iters_train, args.ep * iters_train
     
-    for it, (inp, label) in me.log_every(start_it, iters_train, ld_or_itrt, 30 if iters_train > 8000 else 5, header):
+    # 日志打印频率：优先使用 --log_per；若未设置或异常则回退为旧逻辑（<=8k:5次，>8k:30次）
+    try:
+        pf = int(args.log_per)
+        if pf <= 0:
+            raise ValueError
+    except Exception:
+        pf = 30 if iters_train > 8000 else 5
+
+    for it, (inp, label) in me.log_every(start_it, iters_train, ld_or_itrt, pf, header):
         g_it = ep * iters_train + it
         if it < start_it: continue
         if is_first_ep and it == start_it: warnings.resetwarnings()
