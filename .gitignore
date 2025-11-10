@@ -22,3 +22,5 @@ datasets/
 local_output/
 __pycache__/
 wandb/
+samples_mamba/
+samples_transformer/

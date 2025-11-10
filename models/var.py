@@ -4,7 +4,11 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from huggingface_hub import PyTorchModelHubMixin
+try:
+    from huggingface_hub import PyTorchModelHubMixin
+except Exception:  # optional dependency; allow running without HF hub
+    class PyTorchModelHubMixin:  # type: ignore
+        pass
 
 import dist
 from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
@@ -134,39 +138,52 @@ class VAR(nn.Module):
         label_2B = torch.cat([label_B, torch.full_like(label_B, self.num_classes)], dim=0)
         sos = self.class_emb(label_2B).unsqueeze(1).expand(2*B, self.first_l, -1) + self.pos_start
         lvl_all = self.lvl_embed(self.lvl_1L) + self.pos_1LC
-        seq = sos + lvl_all[:, :self.first_l]  # 2B, first_l, C
+
+        # 构造全长序列：先放入 first_l，再用 (lvl+pos) 作为占位扩展到 L，后续分阶段用预测结果填充对应阶段的上下文位置
+        seq = sos + lvl_all[:, :self.first_l]  # (2B, first_l, C)
+        if self.first_l < self.L:
+            tail = lvl_all[:, self.first_l:].expand(2*B, -1, -1)  # (2B, L-first_l, C)
+            seq = torch.cat([seq, tail], dim=1)  # (2B, L, C)
 
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
-        cur_L = self.first_l
 
         for si, pn in enumerate(self.patch_nums):
-            if si > 0:
-                # 送入 Mamba 得到到目前为止所有位置的隐藏
-                out = self.mamba(inputs_embeds=seq, cond=label_2B)
-                h = out.last_hidden_state  # 2B,cur_L,C
-                logits_stage = self.head(self.head_nm(h.float(), self.class_emb(label_2B)))[:, -pn*pn:, :]  # 2B, l_stage, V
-                ratio = si / self.num_stages_minus_1
-                t = cfg * ratio
-                logits = (1+t)*logits_stage[:B] - t*logits_stage[B:]
-                # 采样
-                idx_Bl = sample_with_top_k_top_p_(logits, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
+            if si == 0:
+                continue  # 第一个尺度（1x1）不生成 token，使用 sos 作为起点
 
-                if not more_smooth:
-                    h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # B,l,Cvae
-                else:
-                    gum_t = max(0.27*(1-ratio*0.95), 0.005)
-                    h_BChw = gumbel_softmax_with_rng(logits.mul(1+ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-                h_BChw = h_BChw.transpose(1,2).reshape(B, self.Cvae, pn, pn)
-                f_hat, next_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
+            # 送入 Mamba，得到全长隐藏；从对应阶段的区间切片作为该阶段的 logits
+            out = self.mamba(inputs_embeds=seq, cond=label_2B)
+            h = out.last_hidden_state  # 2B, L, C
+            logits_all = self.head(self.head_nm(h.float(), self.class_emb(label_2B)))  # 2B, L, V
+            bg, ed = self.begin_ends[si]
+            logits_stage = logits_all[:, bg:ed, :]  # 2B, l_stage, V，其中 l_stage=pn*pn
 
-                if si != self.num_stages_minus_1:
-                    # 准备下一阶段的输入 token embeddings
-                    next_emb = self.word_embed(next_map.view(B, self.Cvae, -1).transpose(1,2))  # B,next_l,C
-                    next_emb = next_emb + lvl_all[:, cur_L:cur_L + self.patch_nums[si+1]**2]
-                    # CFG 扩展
-                    next_emb = next_emb.repeat(2,1,1)
-                    seq = torch.cat([seq, next_emb], dim=1)
-                    cur_L += pn*pn
+            ratio = si / self.num_stages_minus_1
+            t = cfg * ratio
+            logits = (1+t)*logits_stage[:B] - t*logits_stage[B:]
+
+            # 采样得到该阶段的 codebook 索引
+            idx_Bl = sample_with_top_k_top_p_(logits, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
+
+            # 将索引映射为嵌入，并更新 f_hat 与下一阶段的输入图（next_map）
+            if not more_smooth:
+                h_BCl = self.vae_quant_proxy[0].embedding(idx_Bl)  # B,l,Cvae
+            else:
+                gum_t = max(0.27*(1-ratio*0.95), 0.005)
+                h_BCl = gumbel_softmax_with_rng(logits.mul(1+ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+            h_BChw = h_BCl.transpose(1,2).reshape(B, self.Cvae, pn, pn)
+            f_hat, next_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
+
+            # 用 next_map 填充“下一阶段”的上下文嵌入，以提高后续阶段预测质量
+            if si != self.num_stages_minus_1:
+                next_l = self.patch_nums[si+1] ** 2
+                bg_n, ed_n = self.begin_ends[si+1]
+                next_emb = self.word_embed(next_map.view(B, self.Cvae, -1).transpose(1,2))  # B,next_l,C
+                # 加上对应位置的 lvl+pos（与训练时对齐）并扩展到 2B（CFG）
+                next_emb = next_emb + lvl_all[:, bg_n:ed_n]
+                next_emb = next_emb.repeat(2, 1, 1)
+                # 将占位的 lvl+pos（原先的 tail）替换为真实的上下文嵌入
+                seq[:, bg_n:ed_n, :] = next_emb
 
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
 

@@ -186,13 +186,13 @@ def main_training():
     if args.local_debug:
         torch.autograd.set_detect_anomaly(True)
 
-    # # 初始化 wandb
-    # if dist.is_master():
-    #     wandb.init(
-    #         project="VAR",
-    #         name=f"VAR_run_{args.model_type}_{time.strftime('%Y%m%d_%H%M%S')}",
-    #         config=args.__dict__
-    #     )
+    # 初始化 wandb（仅主进程）
+    if dist.is_master():
+        wandb.init(
+            project="VAR",
+            name=f"VAR_run_{args.model_type}_{time.strftime('%Y%m%d_%H%M%S')}",
+            config=args.__dict__
+        )
 
     (
         tb_lg, trainer,
@@ -219,16 +219,16 @@ def main_training():
         )
 
         # 记录关键指标到 wandb
-        # if dist.is_master():
-        #     wandb.log({
-        #         "train/L_mean": stats['Lm'],
-        #         "train/L_tail": stats['Lt'],
-        #         "train/Acc_mean": stats['Accm'],
-        #         "train/Acc_tail": stats['Acct'],
-        #         "train/grad_norm": stats['tnm'],
-        #         "train/epoch": ep,
-        #         "train/sec_per_epoch": sec,
-        #     }, step=ep)
+        if dist.is_master():
+            wandb.log({
+                "train/L_mean": stats['Lm'],
+                "train/L_tail": stats['Lt'],
+                "train/Acc_mean": stats['Accm'],
+                "train/Acc_tail": stats['Acct'],
+                "train/grad_norm": stats['tnm'],
+                "train/epoch": ep,
+                "train/sec_per_epoch": sec,
+            }, step=ep)
 
         L_mean, L_tail, acc_mean, acc_tail, grad_norm = stats['Lm'], stats['Lt'], stats['Accm'], stats['Acct'], stats['tnm']
         best_L_mean, best_acc_mean = min(best_L_mean, L_mean), max(best_acc_mean, acc_mean)
@@ -319,6 +319,11 @@ def main_training():
     args.remain_time, args.finish_time = '-', time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() - 60))
     print(f'final args:\n\n{str(args)}')
     args.dump_log(); tb_lg.flush(); tb_lg.close()
+    if dist.is_master():
+        try:
+            wandb.finish()
+        except Exception as e:
+            print(f"[wandb.finish] error: {e}")
     dist.barrier()
 
 
