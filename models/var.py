@@ -151,12 +151,22 @@ class VAR(nn.Module):
             if si == 0:
                 continue  # 第一个尺度（1x1）不生成 token，使用 sos 作为起点
 
-            # 送入 Mamba，得到全长隐藏；从对应阶段的区间切片作为该阶段的 logits
-            out = self.mamba(inputs_embeds=seq, cond=label_2B)
-            h = out.last_hidden_state  # 2B, L, C
-            logits_all = self.head(self.head_nm(h.float(), self.class_emb(label_2B)))  # 2B, L, V
+            # 送入 Mamba，但只前向到当前已生成的前缀 cur_L，避免每次都计算占位 tail（减少重复计算）
+            cur_L = 0
+            # cur_L should be computed as the length we need up to this stage; since seq is built to full L,
+            # we update cur_L before calling mamba (see below where cur_L is maintained).
+            # In this loop body cur_L should be the length up to this stage:
+            # For stage si, cur_L = sum(patch_nums[:si+1])
+            # We'll compute it here:
+            cur_L = sum(pn * pn for pn in self.patch_nums[: si + 1])
+            # call Mamba with the prefix only:
+            out = self.mamba(inputs_embeds=seq[:, :cur_L, :], cond=label_2B)
+            h = out.last_hidden_state  # 2B, cur_L, C
+            logits_all = self.head(self.head_nm(h.float(), self.class_emb(label_2B)))  # 2B, cur_L, V
             bg, ed = self.begin_ends[si]
-            logits_stage = logits_all[:, bg:ed, :]  # 2B, l_stage, V，其中 l_stage=pn*pn
+            # note: bg/ed are absolute indices in full L; since logits_all has length cur_L, slice accordingly:
+            rel_bg, rel_ed = bg, ed  # these are <= cur_L by construction
+            logits_stage = logits_all[:, rel_bg:rel_ed, :]  # 2B, l_stage, V
 
             ratio = si / self.num_stages_minus_1
             t = cfg * ratio
